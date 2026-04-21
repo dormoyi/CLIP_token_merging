@@ -11,6 +11,8 @@ def test_consistency(model_name):
     device = "cpu"
     jit_model, transform = clip.load(model_name, device=device, jit=True)
     py_model, _ = clip.load(model_name, device=device, jit=False)
+    if hasattr(py_model.visual, "tome_pairs_per_layer"):
+        py_model.visual.tome_pairs_per_layer = 0
 
     image = transform(Image.open("CLIP.png")).unsqueeze(0).to(device)
     text = clip.tokenize(["a diagram", "a dog", "a cat"]).to(device)

@@ -204,11 +204,25 @@ class Transformer(nn.Module):
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
+    def __init__(
+        self,
+        input_resolution: int,
+        patch_size: int,
+        width: int,
+        layers: int,
+        heads: int,
+        output_dim: int,
+        tome_pairs_per_layer: int = 24,
+    ):
         super().__init__()
         self.input_resolution = input_resolution
         self.output_dim = output_dim
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+        self.tome_pairs_per_layer = tome_pairs_per_layer
+        token_count = (input_resolution // patch_size) ** 2
+        pair_i, pair_j = torch.triu_indices(token_count, token_count, offset=1)
+        self.register_buffer("tome_pair_i", pair_i, persistent=False)
+        self.register_buffer("tome_pair_j", pair_j, persistent=False)
 
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
@@ -220,6 +234,80 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
+    def _merge_topk_token_pairs(self, x: torch.Tensor, num_pairs: int) -> torch.Tensor:
+        """
+        Merge `num_pairs` disjoint patch-token pairs with highest cosine similarity.
+        Expects x to be [batch, sequence, width] and keeps the class token untouched.
+        """
+        if num_pairs <= 0:
+            return x
+
+        cls_token = x[:, :1, :]
+        patch_tokens = x[:, 1:, :]
+        batch_size, token_count, width = patch_tokens.shape
+
+        if token_count < 2:
+            return x
+
+        pairs_to_merge = min(num_pairs, token_count // 2)
+        if pairs_to_merge == 0:
+            return x
+
+        tokens_norm = F.normalize(patch_tokens, dim=-1)
+        pair_scores = (
+            tokens_norm[:, self.tome_pair_i, :] * tokens_norm[:, self.tome_pair_j, :]
+        ).sum(dim=-1)
+        sorted_pair_indices = pair_scores.argsort(dim=1, descending=True)
+        dst = torch.empty(batch_size, pairs_to_merge, device=x.device, dtype=torch.long)
+        src = torch.empty(batch_size, pairs_to_merge, device=x.device, dtype=torch.long)
+        merged_pairs = torch.zeros(batch_size, device=x.device, dtype=torch.long)
+
+        for b in range(batch_size):
+            used = torch.zeros(token_count, device=x.device, dtype=torch.bool)
+            write_idx = 0
+            for pair_rank in sorted_pair_indices[b]:
+                i = self.tome_pair_i[pair_rank]
+                j = self.tome_pair_j[pair_rank]
+                if used[i] or used[j]:
+                    continue
+                dst[b, write_idx] = i
+                src[b, write_idx] = j
+                used[i] = True
+                used[j] = True
+                write_idx += 1
+                if write_idx == pairs_to_merge:
+                    break
+            merged_pairs[b] = write_idx
+
+        min_pairs = int(merged_pairs.min().item())
+        if min_pairs == 0:
+            return x
+        dst = dst[:, :min_pairs]
+        src = src[:, :min_pairs]
+        merged_pairs = min_pairs
+
+        token_idx = torch.arange(token_count, device=x.device).unsqueeze(0).expand(batch_size, -1)
+        keep_mask = torch.ones(batch_size, token_count, device=x.device, dtype=torch.bool)
+        keep_mask.scatter_(1, src, False)
+
+        scatter_index = dst.unsqueeze(-1).expand(-1, -1, width)
+        dst_vals = patch_tokens.gather(1, scatter_index)
+        src_vals = patch_tokens.gather(1, src.unsqueeze(-1).expand(-1, -1, width))
+        merged_vals = (dst_vals + src_vals) * 0.5
+
+        merged_tokens = patch_tokens.clone()
+        merged_tokens.scatter_(1, scatter_index, merged_vals)
+
+        # Preserve original ordering of kept tokens after dropping merged-away src tokens.
+        scores = (~keep_mask).to(torch.int64) * token_count + token_idx
+        keep_indices = scores.argsort(dim=1)[:, : token_count - merged_pairs]
+        kept_tokens = merged_tokens.gather(
+            1,
+            keep_indices.unsqueeze(-1).expand(-1, -1, width),
+        )
+
+        return torch.cat([cls_token, kept_tokens], dim=1)
+
     def forward(self, x: torch.Tensor):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
@@ -229,7 +317,15 @@ class VisionTransformer(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        first_block = self.transformer.resblocks[0]
+        x = first_block(x)
+        if self.tome_pairs_per_layer > 0:
+            x = self._merge_topk_token_pairs(
+                x.permute(1, 0, 2),
+                num_pairs=self.tome_pairs_per_layer,
+            ).permute(1, 0, 2)
+        for block in self.transformer.resblocks[1:]:
+            x = block(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x[:, 0, :])
@@ -253,7 +349,8 @@ class CLIP(nn.Module):
                  vocab_size: int,
                  transformer_width: int,
                  transformer_heads: int,
-                 transformer_layers: int
+                 transformer_layers: int,
+                 vision_tome_pairs_per_layer: int = 24,
                  ):
         super().__init__()
 
@@ -276,7 +373,8 @@ class CLIP(nn.Module):
                 width=vision_width,
                 layers=vision_layers,
                 heads=vision_heads,
-                output_dim=embed_dim
+                output_dim=embed_dim,
+                tome_pairs_per_layer=vision_tome_pairs_per_layer,
             )
 
         self.transformer = Transformer(

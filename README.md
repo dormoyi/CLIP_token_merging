@@ -46,6 +46,68 @@ print("Label probs:", probs)  # prints: [[0.9927937  0.00421068 0.00299572]]
 ```
 
 
+## Token Merging in this fork
+
+This repository includes a ViT token-merging path focused on lowering `encode_image()` latency for `ViT-B/32`.
+
+### What changed
+
+- Added token merging inside `VisionTransformer` (`clip/model.py`).
+- Merging is applied once after the first ViT block (not at every block).
+- Default merge budget is `24` token pairs (`tome_pairs_per_layer=24`), reducing patch-token count early.
+- Pair similarity uses cosine similarity.
+- Merged token embedding is the arithmetic mean of the two selected token embeddings.
+- The class token is never merged.
+- Candidate pair index tensors are precomputed once in `__init__` and reused each forward pass:
+  - `self.tome_pair_i`
+  - `self.tome_pair_j`
+
+### Configuration
+
+- `CLIP(..., vision_tome_pairs_per_layer=24)` controls merge count.
+- You can disable merging at runtime with:
+
+```python
+model.visual.tome_pairs_per_layer = 0
+```
+
+### Tests added/updated
+
+- `tests/test_latency.py`: local forward-latency smoke benchmark on a dummy image.
+- `tests/test_tome.py`: checks sequence-length reduction and mean-based merge semantics.
+- `tests/test_consistency.py`: disables ToMe for py-vs-jit parity (`py_model.visual.tome_pairs_per_layer = 0`) so the original consistency test remains valid.
+
+## Latency recipe and measured deltas
+
+Latency was measured with:
+
+```bash
+python -m pytest tests/test_latency.py -q -s
+```
+
+Environment used during tuning:
+
+- model: `ViT-B/32`
+- device: CPU
+- input: one dummy RGB image
+- metric: median latency over 20 timed runs (with warmup in test)
+
+### Changes that helped
+
+- **Baseline** (before these recipe iterations): `23.98 ms`
+- **Cache pair indices once + simplify first-layer block flow**: `21.77 ms` (about `-2.21 ms`)
+- **Compute cosine scores only for valid pair list (no full NxN matrix materialization for selection)**: best observed `21.84 ms` (about `-2.14 ms` vs baseline)
+
+> Note: CPU measurements showed noticeable run-to-run variance in this setup. Use multiple repeats on your target device before drawing hard conclusions.
+
+### Things tried that did not help (or regressed)
+
+- Bipartite matching variant for pair selection.
+- Applying merge before entering the transformer block stack.
+- Bounded `topk` candidate prefilter + fallback instead of full sorted-pair scan.
+- Alternative vectorized greedy matcher with dynamic masking each merge step.
+- Single-thread CPU run (`OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`) in this environment.
+
 ## API
 
 The CLIP module `clip` provides the following methods:
